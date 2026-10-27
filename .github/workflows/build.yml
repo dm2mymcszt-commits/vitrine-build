@@ -1,0 +1,86 @@
+# The public build copy's own workflow (written by scripts/publish-public-copy.py in the private repo). It builds
+# the mod's files only (the kit), never an IPA and without one, and keeps them as an artifact for a day.
+name: Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - uses: actions/checkout@v5
+        with:
+          repository: theos/theos
+          path: theos
+          submodules: recursive
+
+      - name: Install tools
+        run: brew install make dpkg ldid
+
+      - name: The plan card's maker
+        env:
+          PLAN_NAME: ${{ secrets.PLAN_NAME }}
+        run: |
+          test -n "$PLAN_NAME" || { echo "::error::the PLAN_NAME secret is missing"; exit 1; }
+          perl -pi -e 's/__PLAN_NAME__/$ENV{PLAN_NAME}/' tweak/Sources/Redesigned/Plan/Plan.m
+
+      # Spotify's flag table is made from Spotify's own binary and stays out of the public source (it is in
+      # .gitignore): it comes in from the copy's secret FLAG_TABLE_GZ (gzip, then base64), set from the private repo.
+      - name: Spotify's flag table
+        env:
+          FLAG_TABLE_GZ: ${{ secrets.FLAG_TABLE_GZ }}
+        run: |
+          test -n "$FLAG_TABLE_GZ" || { echo "::error::the FLAG_TABLE_GZ secret is missing"; exit 1; }
+          printf '%s' "$FLAG_TABLE_GZ" | base64 -D | gunzip > tweak/Sources/Shared/Flags/SGFlagList.m
+          # Nothing of it is printed: the copy's logs are public.
+          test -s tweak/Sources/Shared/Flags/SGFlagList.m || { echo "::error::the flag table is empty"; exit 1; }
+
+      - run: scripts/build-kit.sh
+
+      - name: Collect the mod's files
+        run: |
+          mkdir -p kit
+          cp "$(ls -t tweak/packages/*.deb | head -1)" kit/
+          cp out/SpotifyGlassAppGroups.dylib kit/
+          cp -R out/extension/SpotifyGlassLiveActivity.appex kit/
+          cp -R out/extension/app/Metadata.appintents kit/
+          cp SOURCE_COMMIT kit/COMMIT
+          if find kit -iname '*.ipa' | grep -q .; then echo "::error::An IPA ended up in the kit"; exit 1; fi
+          ls -la kit
+
+      # A public repo's artifact can be downloaded by anyone signed in to GitHub while it is kept, and the kit holds
+      # the plan card's name and Spotify's flag table: it goes up encrypted with the copy's secret KIT_KEY, whose
+      # other copy stays on the computer that makes the IPA (scripts/wsl-build.sh decrypts it, then deletes the run).
+      - name: Encrypt the kit
+        env:
+          KIT_KEY: ${{ secrets.KIT_KEY }}
+        run: |
+          test -n "$KIT_KEY" || { echo "::error::the KIT_KEY secret is missing"; exit 1; }
+          OPENSSL="$(brew --prefix openssl@3 2>/dev/null || true)/bin/openssl"
+          if [ ! -x "$OPENSSL" ]; then brew install openssl@3 >/dev/null; OPENSSL="$(brew --prefix openssl@3)/bin/openssl"; fi
+          mkdir sealed
+          COPYFILE_DISABLE=1 tar --no-xattrs -czf - -C kit . \
+            | "$OPENSSL" enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:KIT_KEY -out sealed/kit.tar.gz.enc
+          ls -la sealed
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spoti-kit
+          path: sealed/
+          retention-days: 1
